@@ -614,6 +614,7 @@ struct zstream_run_args {
     long len;
     int flush;         /* stream flush value for inflate() or deflate() */
     int interrupt;     /* stop processing the stream and return to ruby */
+    int interrupted;   /* the stream stopped on an interrupt with work left */
     int jump_state;    /* for buffer expansion block break or exception */
     int stream_output; /* for streaming zlib processing */
 };
@@ -1080,7 +1081,7 @@ zstream_run_func(struct zstream_run_args *args)
     uInt n;
 
     int err = Z_OK;
-    while (!args->interrupt) {
+    while (1) {
         n = z->stream.avail_out;
 
         err = (int)(VALUE)rb_ensure(zstream_run_once_begin, (VALUE)args, zstream_run_once_ensure, (VALUE)args);
@@ -1120,6 +1121,11 @@ zstream_run_func(struct zstream_run_args *args)
         if (state) {
             err = Z_OK; /* buffer expanded but stream processing was stopped */
             args->jump_state = state;
+            break;
+        }
+
+        if (args->interrupt) {
+            args->interrupted = 1;
             break;
         }
     }
@@ -1165,18 +1171,16 @@ zstream_run_try(VALUE value_arg)
     }
 
 loop:
+    args->interrupt = 0;
+    args->interrupted = 0;
     err = zstream_run_func(args);
 
-    /* retry if no exception is thrown */
-    if (err == Z_OK && args->interrupt) {
-       args->interrupt = 0;
-
-       /* Retry only if both avail_in > 0 (more input to process) and avail_out > 0
-        * (output buffer has space). If avail_out == 0, the buffer is full and should
-        * be consumed by the caller first. If avail_in == 0, there's nothing more to process. */
-       if (z->stream.avail_in > 0 && z->stream.avail_out > 0) {
-          goto loop;
-       }
+    /* Retry only if the stream stopped on an interrupt. When the last call
+     * already finished its work, another call returns Z_BUF_ERROR; when it
+     * did not (a full output buffer, also with avail_in == 0 under Z_FINISH),
+     * returning now drops the rest of the stream. */
+    if (err == Z_OK && args->interrupted) {
+        goto loop;
     }
 
     if (flush != Z_FINISH && err == Z_BUF_ERROR && z->stream.avail_out > 0) {
@@ -1234,6 +1238,7 @@ zstream_run(struct zstream *z, Bytef *src, long len, int flush)
         .len = len,
         .flush = flush,
         .interrupt = 0,
+        .interrupted = 0,
         .jump_state = 0,
         .stream_output = !ZSTREAM_IS_GZFILE(z) && rb_block_given_p(),
     };
